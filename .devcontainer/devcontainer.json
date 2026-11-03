@@ -1,0 +1,51 @@
+{
+    "name": "Web Async Learning Environment (Java 21 + RabbitMQ)",
+    "image": "mcr.microsoft.com/devcontainers/java:21-trixie",
+    "features": {
+        "ghcr.io/devcontainers/features/java:1": {
+            "version": "none",
+            "installMaven": "true",
+            "installGradle": "false"
+        },
+        "ghcr.io/devcontainers/features/node:2.0.0": {
+            "version": "lts"
+        }
+    },
+    "forwardPorts": [
+        15672,
+        5672
+    ],
+    "portsAttributes": {
+        "15672": {
+            "label": "RabbitMQ 管理画面",
+            "onAutoForward": "notify"
+        },
+        "5672": {
+            "label": "RabbitMQ AMQP",
+            "onAutoForward": "silent"
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "files.encoding": "utf8",
+                "java.server.launchMode": "Standard",
+                "java.configuration.updateBuildConfiguration": "automatic",
+                "java.jdt.ls.java.home": "/usr/lib/jvm/msopenjdk-current",
+                "editor.codeActionsOnSave": {
+                    "source.fixAll.markdownlint": "explicit"
+                }
+            },
+            "extensions": [
+                "vscjava.vscode-java-pack",
+                "MS-CEINTL.vscode-language-pack-ja",
+                "davidanson.vscode-markdownlint",
+                "mermaidchart.vscode-mermaid-chart",
+                "anthropic.claude-code"
+            ]
+        }
+    },
+    "postCreateCommand": "bash .devcontainer/install-rabbitmq.sh && npm install -g markdownlint-cli2 textlint textlint-rule-preset-ja-technical-writing textlint-rule-prh",
+    "postStartCommand": "./broker.sh start",
+    "remoteUser": "vscode"
+}

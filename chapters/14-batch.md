@@ -1,0 +1,344 @@
+# 第14章: 定期バッチ　時刻がジョブを積む
+
+## この章のゴール
+
+定期バッチを、「ジョブを積む役が **時刻** になったジョブキュー」として作ります。サーバーを2台にするとジョブが二重に積まれる問題と、処理が追い付かずにジョブがたまる問題を体験し、基本の対処を知ります。
+
+## Why: なぜこれを学ぶのか
+
+毎晩の売上集計、月末の請求書発行、古いデータの削除など、**決まった時刻に動く処理** は、どのWebサービスにもあります。新卒のエンジニアが最初に任される非同期処理は、ジョブキューの次にこの定期バッチであることが多いでしょう。
+
+定期バッチは、cron（Linux の定期実行の仕組み）にスクリプトを書けば動くので、簡単に見えます。しかし、サーバーが複数台になったり、処理が長引いたりすると、思わぬ問題が起きます。この章では、第10章のジョブキューを土台に、それを体験します。
+
+## 前提
+
+第10〜13章で、ジョブキュー・消失・重複・失敗の扱いを学びました。第3章の地図の②にあたる章です。
+
+## ステップ1: 定期バッチの2つの作り方
+
+| 作り方 | 内容 | 向いている場面 |
+| :--- | :--- | :--- |
+| 直接実行 | 時刻になったら、cron などが処理そのものを実行する | 短くて、失敗しても困らない処理 |
+| キュー経由 | 時刻になったら、**ジョブをキューに積むだけ** にする。処理はワーカーが行う | 長い処理、複数台で分担したい処理、失敗時にやり直したい処理 |
+
+```mermaid
+flowchart LR
+    T[時刻<br>スケジューラー] -->|"ジョブを積む"| Q[(report-jobs)]
+    Q --> W[ワーカー]
+```
+
+**Why**: キュー経由にすると、定期バッチが第10〜13章のジョブキューの仕組みをそのまま使えます。ワーカーを増やして分担でき、失敗したジョブは再配達でき、処理できないジョブは DLQ に逃がせます。「時刻」はジョブを積むきっかけにすぎません。
+
+## ステップ2: スケジューラーとワーカーを書く
+
+売上レポートを作るジョブを、3秒ごとに積むスケジューラーを書きます。本物の定期バッチは「毎晩2時」のような時刻ですが、実験しやすいように短い間隔にしています。
+
+`src/main/java/com/example/async/batch/ReportScheduler.java` を新規作成します。
+
+<!-- code: answers/src/main/java/com/example/async/batch/ReportScheduler.java -->
+```java
+package com.example.async.batch;
+
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+import com.example.async.common.Console;
+import com.example.async.common.RabbitConnection;
+import com.rabbitmq.client.AMQP;
+import com.rabbitmq.client.Channel;
+import com.rabbitmq.client.Connection;
+
+/**
+ * 一定間隔で「売上レポートを作る」ジョブを report-jobs キューに積む、定期バッチのスケジューラー。
+ * 本物の定期バッチは「毎晩2時」のような時刻で動くが、実験しやすいように3秒間隔にしている。
+ */
+public class ReportScheduler {
+    /** ジョブを積むキュー名 */
+    public static final String QUEUE = "report-jobs";
+    // ジョブを積む間隔（ミリ秒）
+    private static final long INTERVAL_MILLIS = 3000;
+
+    /**
+     * スケジューラーを起動する。Ctrl+C で止めるまで、一定間隔でジョブを積み続ける。
+     *
+     * @param args [0] スケジューラー名（省略時は scheduler）, [1] naive / safe（省略時は naive）
+     * @throws Exception 接続に失敗した場合
+     */
+    public static void main(String[] args) throws Exception {
+        String name = args.length > 0 ? args[0] : "scheduler";
+        boolean safe = args.length > 1 && args[1].equals("safe");
+        Connection connection = RabbitConnection.open("report-scheduler-" + name);
+        Channel channel = connection.createChannel();
+        channel.queueDeclare(QUEUE, true, false, false, null);
+
+        // 一定間隔で処理を呼び出す仕組み（JDK 標準）
+        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+        scheduler.scheduleAtFixedRate(() -> {
+            try {
+                tick(channel, name, safe);
+            } catch (Exception e) {
+                // 1回の失敗でスケジューラー全体を止めない。次の周期でまたやり直す
+                Console.log(name + " ジョブを積めませんでした: " + e);
+            }
+        }, 0, INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+        Console.log(name + " 起動（" + (safe ? "safe" : "naive") + " モード）。" + INTERVAL_MILLIS + "ms ごとにジョブを積みます");
+    }
+
+    // 1回ぶんの処理。ジョブを1件積む
+    private static void tick(Channel channel, String name, boolean safe) throws Exception {
+        // 今キューにたまっている件数。ワーカーが追い付いているかの目安になる
+        int backlog = channel.queueDeclarePassive(QUEUE).getMessageCount();
+        // 「第何周期か」を表す番号。同じ周期なら、どのスケジューラーが積んでも同じ値になる
+        long slot = System.currentTimeMillis() / INTERVAL_MILLIS;
+        String jobId;
+        if (safe) {
+            // 前回のジョブがまだ残っているなら、積まずにスキップする（積み上がりを防ぐ）
+            if (backlog > 0) {
+                Console.log(name + " スキップ: 未処理のジョブが " + backlog + " 件あります");
+                return;
+            }
+            // 周期の番号からジョブIDを決める。同じ周期のジョブは、必ず同じIDになる
+            jobId = "report-" + slot;
+        } else {
+            // 毎回、新しい一意なIDを振る
+            jobId = "report-" + UUID.randomUUID();
+        }
+        // ジョブIDを messageId に入れて、永続メッセージとして積む
+        AMQP.BasicProperties props = new AMQP.BasicProperties.Builder()
+                .messageId(jobId).deliveryMode(2).build();
+        channel.basicPublish("", QUEUE, props, ("売上レポート " + slot).getBytes(StandardCharsets.UTF_8));
+        Console.log(name + " ジョブを積みました " + jobId + "（キューの滞留 " + backlog + " 件）");
+    }
+}
+```
+
+**Why**: `ScheduledExecutorService` は、JDK 標準の「一定間隔で処理を呼び出す」仕組みです。`scheduleAtFixedRate` で、3秒ごとに `tick` を呼びます。スケジューラーの中は例外を捕まえています。1回の失敗でスケジューラー全体が止まると、以後のジョブがすべて積まれなくなるためです。
+
+起動引数の `naive` と `safe` は、ステップ6で使います。まずは `naive` で動かします。
+
+ジョブを処理するワーカーも書きます。`src/main/java/com/example/async/batch/ReportWorker.java` を新規作成します。
+
+<!-- code: answers/src/main/java/com/example/async/batch/ReportWorker.java -->
+```java
+package com.example.async.batch;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
+import java.util.Set;
+
+import com.example.async.common.Console;
+import com.example.async.common.RabbitConnection;
+import com.rabbitmq.client.AMQP;
+import com.rabbitmq.client.Channel;
+import com.rabbitmq.client.Connection;
+import com.rabbitmq.client.DefaultConsumer;
+import com.rabbitmq.client.Envelope;
+
+/**
+ * report-jobs キューから売上レポートのジョブを取り出して処理するワーカー。
+ * 同じジョブID（messageId）を2回受け取ったら、2回目は処理せずに捨てる。
+ */
+public class ReportWorker extends DefaultConsumer {
+    // 1件の処理にかかる時間（ミリ秒）
+    private final long workMillis;
+    // 処理済みのジョブID（学習用にメモリ上で持つ。本番は DB に保存する）
+    private final Set<String> processed = new HashSet<>();
+
+    /**
+     * @param channel    使うチャネル
+     * @param workMillis 1件の処理にかかる時間（ミリ秒）
+     */
+    public ReportWorker(Channel channel, long workMillis) {
+        super(channel);
+        this.workMillis = workMillis;
+    }
+
+    /**
+     * レポート作成のジョブを1件処理する。
+     */
+    @Override
+    public void handleDelivery(String consumerTag, Envelope envelope,
+            AMQP.BasicProperties properties, byte[] body) throws IOException {
+        String jobId = properties.getMessageId();
+        String text = new String(body, StandardCharsets.UTF_8);
+        if (!processed.add(jobId)) {
+            // Set.add が false を返すのは、すでに処理済みのジョブID
+            Console.log("重複のためスキップ " + jobId);
+        } else {
+            Console.log("レポート作成 開始 " + jobId + "（" + text + "）");
+            Console.sleep(workMillis);
+            Console.log("レポート作成 完了 " + jobId);
+        }
+        getChannel().basicAck(envelope.getDeliveryTag(), false);
+    }
+
+    /**
+     * ワーカーを起動する。
+     *
+     * @param args [0] 1件の処理時間（秒、省略時は 1）
+     * @throws Exception 接続に失敗した場合
+     */
+    public static void main(String[] args) throws Exception {
+        long workMillis = (args.length > 0 ? Long.parseLong(args[0]) : 1) * 1000;
+        Connection connection = RabbitConnection.open("report-worker");
+        Channel channel = connection.createChannel();
+        channel.queueDeclare(ReportScheduler.QUEUE, true, false, false, null);
+        channel.basicQos(1);
+        channel.basicConsume(ReportScheduler.QUEUE, false, new ReportWorker(channel, workMillis));
+        Console.log("ワーカー起動（1件 " + workMillis / 1000 + " 秒）。Ctrl+C で終了します");
+    }
+}
+```
+
+## ステップ3: 1台で動かす
+
+ワーカー（1件1秒）とスケジューラーを、別々のターミナルで起動します。
+
+```bash
+# ターミナル1
+./run.sh batch.ReportWorker 1
+```
+
+```bash
+# ターミナル2
+./run.sh batch.ReportScheduler A naive
+```
+
+```text
+[13:43:35.101][pool-3-thread-1] A ジョブを積みました report-d212d86a-…（キューの滞留 0 件）
+[13:43:35.140][pool-1-thread-4] レポート作成 開始 report-d212d86a-…（売上レポート 597904489）
+[13:43:36.145][pool-1-thread-4] レポート作成 完了 report-d212d86a-…
+[13:43:38.101][pool-3-thread-1] A ジョブを積みました report-8cdbb8e4-…（キューの滞留 0 件）
+```
+
+3秒ごとにジョブが積まれ、ワーカーが1秒で処理しています。滞留は0件で、問題なく動いています。
+
+## ステップ4: サーバーを2台にする
+
+本番では、冗長化や負荷分散のために、アプリを複数台で動かします。そのとき、スケジューラーも2台ぶん動きます。2つめのスケジューラーを、別のターミナルで起動します。
+
+```bash
+# ターミナル3
+./run.sh batch.ReportScheduler B naive
+```
+
+ワーカーのログを見ると、同じ周期のレポートが **2件ずつ** 処理されています。ジョブIDが毎回ランダムなので、ワーカーは重複に気づけません。
+
+```text
+[13:43:47.130] 開始 report-34dad7f6-…（売上レポート 597904493）
+[13:43:48.210] 開始 report-fb754dd7-…（売上レポート 597904493）
+```
+
+同じ「周期の番号」（597904493）のレポートが、2回作られています。サーバー2台で5周期動かすと、10件のレポートが作られました。
+
+**Why**: 2台のスケジューラーは、お互いの存在を知りません。それぞれが時刻のたびにジョブを積むため、台数の分だけジョブが増えます。レポートが2回作られるだけなら無駄で済みます。請求書の発行やメールの一斉送信なら、二重に届いたお客さまからの苦情になります。
+
+## ステップ5: 処理が追い付かないとどうなるか
+
+スケジューラー B を止めます。ワーカーを、1件5秒かかる設定で起動し直します（ワーカーは Ctrl+C で止めてから起動します）。
+
+```bash
+./run.sh batch.ReportWorker 5
+```
+
+スケジューラーは3秒ごとにジョブを積みますが、ワーカーは5秒かかります。積む速さが、処理する速さを上回ります。
+
+```text
+A ジョブを積みました report-0bc58ff3-…（キューの滞留 0 件）
+A ジョブを積みました report-f3bd0863-…（キューの滞留 1 件）
+A ジョブを積みました report-119cb7f1-…（キューの滞留 1 件）
+A ジョブを積みました report-2d463828-…（キューの滞留 2 件）
+```
+
+滞留が増え続けています。時間がたつほどジョブがたまり、「今夜のレポート」が、翌朝になっても処理されない状態になります。
+
+**Why**: 定期バッチは、前回の処理が終わったかどうかを気にせず、時刻が来たらジョブを積みます。処理が遅れたり、障害でワーカーが止まったりすると、積まれたジョブがどんどんたまります。復旧した瞬間に、たまったジョブを一気に処理し、データベースに負荷が集中することもあります。
+
+## ステップ6: 基本の対処　ジョブIDと重複排除、未処理ならスキップ
+
+2つの問題に、第12章で学んだ考え方を使います。
+
+1. **周期の番号からジョブIDを決める**（`report-<周期番号>`）。2台のスケジューラーが同じ周期に積んだジョブは、同じIDになる
+2. **ワーカーが処理済みのジョブIDを覚えておき、2回目は捨てる**（`ReportWorker` の `processed`）
+3. **未処理のジョブが残っているなら、積まずにスキップする**
+
+`safe` モードで動かします。スケジューラーを2台、ワーカーを1件1秒で起動し直します。
+
+```bash
+# ターミナル1
+./run.sh batch.ReportWorker 1
+```
+
+```bash
+# ターミナル2
+./run.sh batch.ReportScheduler A safe
+```
+
+```bash
+# ターミナル3
+./run.sh batch.ReportScheduler B safe
+```
+
+```text
+[13:44:46.130][pool-1-thread-4] レポート作成 開始 report-597904489（売上レポート 597904489）
+[13:44:46.145][pool-1-thread-5] 重複のためスキップ report-597904489
+[13:44:49.131][pool-1-thread-6] レポート作成 開始 report-597904490（売上レポート 597904490）
+[13:44:49.140][pool-1-thread-7] 重複のためスキップ report-597904490
+```
+
+2台が同じ周期にジョブを積んでも、レポートは1回だけ作られました。
+
+ワーカーを1件5秒に戻すと、スケジューラーは積み上がる前にスキップします。
+
+```text
+A ジョブを積みました report-597904496（キューの滞留 0 件）
+A ジョブを積みました report-597904497（キューの滞留 0 件）
+A スキップ: 未処理のジョブが 1 件あります
+```
+
+**Why**: 2台のスケジューラーが同時に動いても、結果は1台のときと同じになります。これは第12章の **冪等性** そのものです。時刻が来るたびにジョブを積む定期バッチは、重複が必ず起こる前提で作ります。
+
+**⚠️ よくある失敗・誤解**: `safe` モードの「滞留」は、キューにたまっている（まだ誰にも渡していない）ジョブの数です。ワーカーが今処理している最中のジョブは数えません。そのため、スキップの判断は「次の周期が来たとき、前のジョブが終わらず、新しく積んだものが待っている」状況で効きます。
+
+## ステップ7: 本番で気をつけること
+
+- **スケジューラーを1台だけで動かす**: 冪等にするだけでなく、そもそも1台しか積まないようにするのが理想です。次のような方法があります。
+  - Kubernetes の CronJob や、クラウドのスケジューラー（Amazon EventBridge Scheduler、Google Cloud Scheduler）を使う。これらは時刻に1回だけ、1つのジョブを起動する
+  - アプリ内にスケジューラーを持つ場合は、DB のロックや、リーダー選出の仕組みで「担当するのは1台だけ」にする（Quartz のクラスター機能、ShedLock など）
+- **止まっていた間の取りこぼし**: アプリが止まっていた時間帯に、時刻が来たジョブは積まれません。「起動時に、前回の実行以降の分を埋める」処理が要るかを、業務ごとに決めます。
+- **時刻の扱い**: タイムゾーン（サーバーは UTC、業務は日本時間など）、夏時間、月末や閏年に注意します。「毎月31日」は、30日までの月には存在しません。
+- **集中する時刻を避ける**: 全員が毎日0時ちょうどに動かすと、その時刻にサーバーやデータベースの負荷が集中します。数分ずらして分散させます。
+- **長い処理は分割する**: 100万件を1つのジョブで処理するのではなく、1万件ずつの100個のジョブに分けて積むと、ワーカーを増やして並列に処理でき、失敗してもやり直す範囲が小さくなります。
+- **結果を通知する**: バッチの成否に、誰かが気づける仕組みを用意します。「動いているはず」の集計が何週間も止まっていた、という話は珍しくありません。実行の履歴も残します。
+
+**💼 現場Tip**: データの連鎖を扱うバッチの世界には、Apache Airflow のように、ジョブの依存関係（A が終わったら B と C、両方終わったら D）を定義して実行するツールがあります。これは第21〜22章のワークフローと同じ考え方を、定期バッチに応用したものです。
+
+## 動作確認
+
+次の3点を確認できたら完了です。
+
+1. `naive` でスケジューラーを2台にすると、同じ周期のレポートが2回作られた
+2. ワーカーが遅いと、キューの滞留が増え続けた
+3. `safe` では、2台でもレポートが1回だけ作られ、遅いときは積み上がる前にスキップされた
+
+## もっと良くしてみよう
+
+### 理解確認
+
+1. 定期バッチを「キュー経由」にすると、直接実行に比べて何がよくなるでしょうか。
+2. サーバーを2台にしたとき、ジョブが二重に積まれるのはなぜでしょうか。
+3. 周期の番号からジョブIDを決めると、二重に積まれても大丈夫になるのはなぜでしょうか。
+
+### 発展改善クイズ
+
+1. `safe` モードでも、2台のスケジューラーが同時に滞留の件数を調べると、両方とも「0件」と判断して積んでしまいます。それでも結果が正しくなるのは、何のおかげでしょうか。
+2. スケジューラーのアプリが丸1日止まっていて、再起動したとします。止まっていた間の24回ぶんのジョブを、積み直すべきでしょうか。業務の種類によって、答えがどう変わるか考えてみましょう。
+
+---
+
+| [← 第13章: 処理できないメッセージとデッドレターキュー](./13-dead-letter-queue.md) | [全章目次](./README.md) | [第15章: Pub/Subパターンとは →](./15-what-is-pubsub.md) |
+| - | :-: | --: |
