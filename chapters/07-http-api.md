@@ -235,6 +235,23 @@ public class HttpPollingConsumer {
 
 確認できたら、受信側を Ctrl+C で止めます。
 
+ポーリングの流れを図にすると、次のようになります。受信側は、メッセージの有無と関係なく、3秒ごとに問い合わせます。
+
+```mermaid
+sequenceDiagram
+    participant P as HttpPublisher
+    participant B as RabbitMQ
+    participant C as HttpPollingConsumer
+    C->>B: 届いていますか
+    B-->>C: 空（空振り）
+    P->>B: 注文 A-2 を送る
+    Note over B,C: 次に聞きに来るまで<br>最大3秒待たされる（遅延）
+    C->>B: 届いていますか
+    B-->>C: 注文 A-2
+    C->>B: 届いていますか
+    B-->>C: 空（空振り）
+```
+
 **Why**: ポーリングには、次の2つの問題があります。
 
 1. **遅延**: 送ってから受け取るまで、最大でポーリング間隔（3秒）待たされる

@@ -24,6 +24,22 @@
 | プロパティ（headers） | 標準にない、配送や処理に関わる情報 | `schema-version` |
 | 本文 | 業務の情報そのもの | 注文ID、顧客ID、金額、出来事が起きた時刻 |
 
+1通のメッセージを封筒にたとえると、次のようになります。
+
+```mermaid
+flowchart TB
+    subgraph MSG["1通の AMQP メッセージ"]
+        direction TB
+        subgraph ENV["封筒: プロパティ（本文を開かずに読める）"]
+            STD["標準<br>messageId / type / contentType / timestamp / appId"]
+            HDR["headers<br>schema-version"]
+        end
+        subgraph BODY["中身: 本文（JSON）"]
+            DATA["注文ID / 顧客ID / 金額 / 出来事が起きた時刻"]
+        end
+    end
+```
+
 **Why**: プロパティに置いた情報は、本文を解析しなくても読めます。受け手は、知らない `type` のイベントを本文を開かずに読み飛ばせます。headers エクスチェンジやトレースのツールなど、ブローカーや周辺の仕組みもプロパティを見て動きます。
 
 ## ステップ2: イベントクラスを書く

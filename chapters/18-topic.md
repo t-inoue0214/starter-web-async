@@ -197,6 +197,17 @@ public class TopicSubscriber extends DefaultConsumer {
 
 各サービスに届くイベントは次のとおりです。
 
+エクスチェンジとキューの Binding を図にすると、次のようになります。
+
+```mermaid
+flowchart LR
+    P[OrderEventTopicPublisher] -->|"order.placed.jp<br>order.placed.us<br>order.cancelled.jp<br>order.shipped.jp<br>order.shipped.us"| EX((order-events<br>topic))
+    EX -->|"order.placed.*"| QM[(mail)]
+    EX -->|"*.*.jp"| QJ[(jp-ops)]
+    EX -->|"#"| QA[(analytics)]
+    EX -->|"order.cancelled.*"| QR[(refund)]
+```
+
 | サービス | バインディングキー | 届く件数 | 届くルーティングキー |
 | :--- | :--- | :--- | :--- |
 | mail | `order.placed.*` | 2 | `order.placed.jp`、`order.placed.us` |

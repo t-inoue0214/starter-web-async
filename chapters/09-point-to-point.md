@@ -193,6 +193,22 @@ public class HelloConsumer extends DefaultConsumer {
 
 **Why**: 第7章のポーリングとの違いを確かめましょう。コンシューマーは何もリクエストを送っていません。ブローカーがメッセージを受け取った瞬間に `basic.deliver` で押し出し、ライブラリが `handleDelivery` を呼び出しています。
 
+送信から受信までの流れを図にすると、次のようになります。コンシューマーが購読を伝えるのは最初の1回だけです。
+
+```mermaid
+sequenceDiagram
+    participant P as HelloProducer
+    participant B as RabbitMQ
+    participant C as HelloConsumer
+    C->>B: basic.consume（購読を1回だけ伝える）
+    B-->>C: basic.consume-ok
+    P->>B: basic.publish こんにちは #1
+    B->>C: basic.deliver こんにちは #1
+    Note over C: handleDelivery が呼ばれる
+    P->>B: basic.publish こんにちは #2
+    B->>C: basic.deliver こんにちは #2
+```
+
 ログのスレッド名が `main` ではなく `pool-1-thread-4` になっていることにも注目してください。`handleDelivery` は、ライブラリが用意したスレッドプールのスレッドから呼ばれます。
 
 **⚠️ よくある失敗・誤解**: 1つのチャネルに届いたメッセージの `handleDelivery` は、**1件ずつ順番に** 呼ばれます。`handleDelivery` の中で時間のかかる処理をすると、その間、同じチャネルの次のメッセージは待たされます。「受信が遅い」と感じたら、まず `handleDelivery` の中で何に時間がかかっているかを疑いましょう。
@@ -214,6 +230,15 @@ public class HelloConsumer extends DefaultConsumer {
 1つめのコンシューマーには `#1`・`#3`・`#5`、2つめには `#2`・`#4`・`#6` が届きます。
 
 **Why**: 1つのキューに複数のコンシューマーがいると、ブローカーはメッセージを **順番に1件ずつ配ります（ラウンドロビン）**。1件のメッセージは、どちらか一方にしか届きません。これが第15章の P2P モデルです。コンシューマーを増やすだけで、処理を分担させられます。
+
+配られ方を図にすると、次のようになります。
+
+```mermaid
+flowchart LR
+    P[HelloProducer] --> Q[(hello)]
+    Q -->|"#1, #3, #5"| C1[コンシューマー 1]
+    Q -->|"#2, #4, #6"| C2[コンシューマー 2]
+```
 
 **🔍 確認・実験してみよう**: コンシューマーを2つ起動したまま、管理画面で `hello` キューを開き、下のほうにある「Delete」ボタンでキューを削除してみましょう。コンシューマーには何が起きるでしょうか。`handleCancel` を上書きしてログを出すようにすると、何がわかるか試してみましょう。
 
