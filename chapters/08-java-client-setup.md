@@ -2,21 +2,21 @@
 
 ## この章のゴール
 
-`pom.xml` に RabbitMQ の Java クライアント `amqp-client` を追加し、AMQP で RabbitMQ に接続できることを確認します。接続処理を共通クラス `RabbitConnection` にまとめます。
+`pom.xml` に入っている RabbitMQ の Java クライアント `amqp-client` の役割を知り、AMQP で RabbitMQ に接続できることを確認します。接続処理をまとめた共通クラス `RabbitConnection` を読みます。
 
 ## Why: なぜこれを学ぶのか
 
-第7章で、HTTP のポーリングでは「届いた瞬間に受け取る」ことができないとわかりました。プッシュ型で受け取るには、ブローカーとの TCP 接続を張りっぱなしにして、AMQP のフレームを読み書きし続ける必要があります。さらに、ハートビート（生存確認）、切断時の再接続、チャネルの管理も必要です。これを自分で実装するのは大変なので、RabbitMQ チームが提供している公式ライブラリを使います。
+第7章で、HTTP のポーリングでは「届いた瞬間に受け取る」ことができないとわかりました。届いた瞬間に受け取る（プッシュ型）には、ブローカーとの接続を張りっぱなしにして、AMQP の決まりごとに沿ったデータを読み書きし続ける必要があります。さらに、相手が生きているかの定期確認、切れたときの再接続、チャネルの管理も必要です。これを自分で実装するのは大変なので、RabbitMQ の開発元が提供している公式ライブラリを使います。
 
-この講座で初めて外部ライブラリを追加します。`starter-java-build-tools` で学んだ Maven の依存関係の知識がここで生きてきます。
+この講座で初めて外部ライブラリを使います。`starter-java-build-tools` で学んだ Maven の依存関係の知識がここで生きてきます。
 
 ## 前提
 
-第7章までで、RabbitMQ の管理画面と HTTP API に触れました。`pom.xml` の `<dependencies>` には、まだ何も書かれていません。
+第7章までで、RabbitMQ の管理画面と HTTP API に触れました。
 
-## ステップ1: pom.xml に依存ライブラリを追加する
+## ステップ1: pom.xml の依存ライブラリを確認する
 
-`pom.xml` の `<dependencies>` に、次の2つを追加します。
+[pom.xml](../pom.xml) を開きます。`<dependencies>` には、次の2つが書かれています。
 
 ```xml
     <dependencies>
@@ -35,7 +35,7 @@
     </dependencies>
 ```
 
-追加したら、依存関係の木を表示してみます。
+依存関係の木を表示してみます。
 
 ```bash
 mvn -q dependency:tree -DoutputFile=/dev/stdout
@@ -70,112 +70,46 @@ SLF4J: Defaulting to no-operation (NOP) logger implementation
 
 `dependency:tree` を見ると、`amqp-client` が使っている `slf4j-api` は 1.7.36 です。SLF4J は 1.7 系と 2.x 系で実装を探す仕組みが変わったため、API と実装のメジャーバージョンをそろえる必要があります。「推移的に入ってくるライブラリのバージョンを確かめる」のは、Maven で依存関係を追加するときの基本動作です。
 
-## ステップ2: 接続を作る共通クラスを書く
+## ステップ2: 接続を作る共通クラスを読む
 
-接続先のホストやパスワードは、どのプログラムでも同じです。毎回書かずに済むよう、共通クラスにまとめます。`src/main/java/com/example/async/common/RabbitConnection.java` を新規作成します。
+接続先のホストやパスワードは、どのプログラムでも同じです。毎回書かずに済むよう、共通クラスにまとめてあります。[RabbitConnection.java](../src/main/java/com/example/async/common/RabbitConnection.java) を開きます。中心となる部分を抜粋します。
 
-<!-- code: answers/src/main/java/com/example/async/common/RabbitConnection.java -->
+<!-- code: src/main/java/com/example/async/common/RabbitConnection.java#open -->
 ```java
-package com.example.async.common;
-
-import java.io.IOException;
-import java.util.concurrent.TimeoutException;
-
-import com.rabbitmq.client.Connection;
-import com.rabbitmq.client.ConnectionFactory;
-
 /**
- * RabbitMQ への接続を作る共通クラス。
- * 接続先は環境変数で差し替えられ、未設定なら開発コンテナ内の学習用ブローカーに接続する。
+ * RabbitMQ に接続する。
+ *
+ * @param connectionName 管理画面の Connections 一覧に表示される名前
+ * @return 確立した接続（使い終わったら close すること）
+ * @throws IOException      ネットワークや認証に失敗した場合
+ * @throws TimeoutException 接続がタイムアウトした場合
  */
-public final class RabbitConnection {
-
-    private RabbitConnection() {
-    }
-
-    /**
-     * RabbitMQ に接続する。
-     *
-     * @param connectionName 管理画面の Connections 一覧に表示される名前
-     * @return 確立した接続（使い終わったら close すること）
-     * @throws IOException      ネットワークや認証に失敗した場合
-     * @throws TimeoutException 接続がタイムアウトした場合
-     */
-    public static Connection open(String connectionName) throws IOException, TimeoutException {
-        // 接続設定の入れ物を作る
-        ConnectionFactory factory = new ConnectionFactory();
-        // 接続先ホスト・ポート・ユーザー・パスワードを環境変数から読む（なければ学習用の既定値）
-        factory.setHost(env("RABBITMQ_HOST", "localhost"));
-        factory.setPort(Integer.parseInt(env("RABBITMQ_PORT", "5672")));
-        factory.setUsername(env("RABBITMQ_USER", "app"));
-        factory.setPassword(env("RABBITMQ_PASSWORD", "app"));
-        // 仮想ホスト（ブローカー内の論理的な区画）。既定は "/"
-        factory.setVirtualHost(env("RABBITMQ_VHOST", "/"));
-        // 接続が切れたら自動で再接続する（amqp-client 4.0 以降は既定で有効だが、明示しておく）
-        factory.setAutomaticRecoveryEnabled(true);
-        // 名前を付けて接続する
-        return factory.newConnection(connectionName);
-    }
-
-    // 環境変数を読み、未設定または空なら既定値を返す
-    private static String env(String name, String defaultValue) {
-        String value = System.getenv(name);
-        if (value == null || value.isBlank()) {
-            return defaultValue;
-        }
-        return value;
-    }
+public static Connection open(String connectionName) throws IOException, TimeoutException {
+    // 接続設定の入れ物を作る
+    ConnectionFactory factory = new ConnectionFactory();
+    // 接続先ホスト・ポート・ユーザー・パスワードを環境変数から読む（なければ学習用の既定値）
+    factory.setHost(env("RABBITMQ_HOST", "localhost"));
+    factory.setPort(Integer.parseInt(env("RABBITMQ_PORT", "5672")));
+    factory.setUsername(env("RABBITMQ_USER", "app"));
+    factory.setPassword(env("RABBITMQ_PASSWORD", "app"));
+    // 仮想ホスト（ブローカー内の論理的な区画）。既定は "/"
+    factory.setVirtualHost(env("RABBITMQ_VHOST", "/"));
+    // 接続が切れたら自動で再接続する（amqp-client 4.0 以降は既定で有効だが、明示しておく）
+    factory.setAutomaticRecoveryEnabled(true);
+    // 名前を付けて接続する
+    return factory.newConnection(connectionName);
 }
 ```
 
-**Why**: `ConnectionFactory` は「どこに、誰として接続するか」の設定を持つ工場クラスです。`newConnection` を呼ぶたびに新しい TCP 接続を作ります。接続先を環境変数で差し替えられるのは、開発・検証・本番で接続先が変わっても、コードを書き換えずに済ませるためです。
+**Why**: `ConnectionFactory` は「どこに、誰として接続するか」の設定を持つ工場クラスです。`newConnection` を呼ぶたびに新しい接続を作ります。接続先を環境変数で差し替えられるのは、開発・検証・本番で接続先が変わっても、コードを書き換えずに済ませるためです。
 
-`setAutomaticRecoveryEnabled(true)` は、ネットワークの瞬断やブローカーの再起動で接続が切れたとき、ライブラリが自動で再接続し、チャネルや購読も作り直す設定です。第11章で、その動きを実際に確かめます。
+`setAutomaticRecoveryEnabled(true)` は、ネットワークの瞬断やブローカーの再起動で接続が切れたとき、ライブラリが自動で再接続し、チャネルや受け取りの登録も作り直す設定です。第11章で、その動きを実際に確かめます。
 
 `newConnection` に渡した名前は、管理画面の Connections タブに表示されます。本番で「この接続はどのアプリのものか」を調べるときの手がかりになります。
 
-## ステップ3: 接続を確認するプログラムを書く
+## ステップ3: 接続を確認するプログラムを読む
 
-`src/main/java/com/example/async/hello/ConnectionCheck.java` を新規作成します。
-
-<!-- code: answers/src/main/java/com/example/async/hello/ConnectionCheck.java -->
-```java
-package com.example.async.hello;
-
-import com.example.async.common.Console;
-import com.example.async.common.RabbitConnection;
-import com.rabbitmq.client.Channel;
-import com.rabbitmq.client.Connection;
-
-/**
- * RabbitMQ に AMQP で接続できるか確認するクラス。
- * 接続とチャネルを開いたまま30秒待つので、その間に管理画面で様子を見られる。
- */
-public class ConnectionCheck {
-
-    /**
-     * 接続・チャネルを開き、ブローカーの情報を表示して30秒後に閉じる。
-     *
-     * @param args 使わない
-     * @throws Exception 接続に失敗した場合
-     */
-    public static void main(String[] args) throws Exception {
-        // try-with-resources で、最後に必ず接続とチャネルを閉じる
-        try (Connection connection = RabbitConnection.open("connection-check");
-                Channel channel = connection.createChannel()) {
-            // ブローカーが接続時に教えてくれた製品名とバージョンを表示する
-            Console.log("接続OK product=" + connection.getServerProperties().get("product")
-                    + " version=" + connection.getServerProperties().get("version"));
-            // チャネル番号を表示する（1本の接続の中に複数のチャネルを作れる）
-            Console.log("チャネル番号=" + channel.getChannelNumber());
-            // 管理画面の Connections / Channels タブを確認する時間をとる
-            Console.log("30秒待ちます。管理画面の Connections タブを見てみましょう");
-            Thread.sleep(30_000);
-        }
-        Console.log("接続を閉じました");
-    }
-}
-```
+[ConnectionCheck.java](../src/main/java/com/example/async/hello/ConnectionCheck.java) を開いて、コードを読んでみましょう。
 
 **Why**: `Connection` と `Channel` はどちらも `AutoCloseable` なので、try-with-resources で確実に閉じられます。閉じ忘れた接続はブローカー側に残り続け、接続数の上限やメモリを圧迫します。
 

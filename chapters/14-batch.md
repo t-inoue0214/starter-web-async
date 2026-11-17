@@ -2,7 +2,7 @@
 
 ## この章のゴール
 
-定期バッチを、「ジョブを積む役が **時刻** になったジョブキュー」として作ります。サーバーを2台にするとジョブが二重に積まれる問題と、処理が追い付かずにジョブがたまる問題を体験し、基本の対処を知ります。
+定期バッチ（決まった時刻に自動で動く処理）を、「ジョブを積む役が **時刻** になったジョブキュー」として作ります。時刻になったらジョブを積む役のプログラムを、この章では **スケジューラー** と呼びます。サーバーを2台にするとジョブが二重に積まれる問題と、処理が追い付かずにジョブがたまる問題を体験し、基本の対処を知ります。
 
 ## Why: なぜこれを学ぶのか
 
@@ -29,89 +29,38 @@ flowchart LR
 
 **Why**: キュー経由にすると、定期バッチが第10〜13章のジョブキューの仕組みをそのまま使えます。ワーカーを増やして分担でき、失敗したジョブは再配達でき、処理できないジョブは DLQ に逃がせます。「時刻」はジョブを積むきっかけにすぎません。
 
-## ステップ2: スケジューラーとワーカーを書く
+## ステップ2: スケジューラーとワーカーを読む
 
-売上レポートを作るジョブを、3秒ごとに積むスケジューラーを書きます。本物の定期バッチは「毎晩2時」のような時刻ですが、実験しやすいように短い間隔にしています。
+売上レポートを作るジョブを、3秒ごとに積むスケジューラーを読みます。本物の定期バッチは「毎晩2時」のような時刻ですが、実験しやすいように短い間隔にしています。
 
-`src/main/java/com/example/async/batch/ReportScheduler.java` を新規作成します。
+[ReportScheduler.java](../src/main/java/com/example/async/batch/ReportScheduler.java) を開きます。中心となる部分を抜粋します。
 
-<!-- code: answers/src/main/java/com/example/async/batch/ReportScheduler.java -->
+<!-- code: src/main/java/com/example/async/batch/ReportScheduler.java#tick -->
 ```java
-package com.example.async.batch;
-
-import java.nio.charset.StandardCharsets;
-import java.util.UUID;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
-
-import com.example.async.common.Console;
-import com.example.async.common.RabbitConnection;
-import com.rabbitmq.client.AMQP;
-import com.rabbitmq.client.Channel;
-import com.rabbitmq.client.Connection;
-
-/**
- * 一定間隔で「売上レポートを作る」ジョブを report-jobs キューに積む、定期バッチのスケジューラー。
- * 本物の定期バッチは「毎晩2時」のような時刻で動くが、実験しやすいように3秒間隔にしている。
- */
-public class ReportScheduler {
-    /** ジョブを積むキュー名 */
-    public static final String QUEUE = "report-jobs";
-    // ジョブを積む間隔（ミリ秒）
-    private static final long INTERVAL_MILLIS = 3000;
-
-    /**
-     * スケジューラーを起動する。Ctrl+C で止めるまで、一定間隔でジョブを積み続ける。
-     *
-     * @param args [0] スケジューラー名（省略時は scheduler）, [1] naive / safe（省略時は naive）
-     * @throws Exception 接続に失敗した場合
-     */
-    public static void main(String[] args) throws Exception {
-        String name = args.length > 0 ? args[0] : "scheduler";
-        boolean safe = args.length > 1 && args[1].equals("safe");
-        Connection connection = RabbitConnection.open("report-scheduler-" + name);
-        Channel channel = connection.createChannel();
-        channel.queueDeclare(QUEUE, true, false, false, null);
-
-        // 一定間隔で処理を呼び出す仕組み（JDK 標準）
-        ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-        scheduler.scheduleAtFixedRate(() -> {
-            try {
-                tick(channel, name, safe);
-            } catch (Exception e) {
-                // 1回の失敗でスケジューラー全体を止めない。次の周期でまたやり直す
-                Console.log(name + " ジョブを積めませんでした: " + e);
-            }
-        }, 0, INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
-        Console.log(name + " 起動（" + (safe ? "safe" : "naive") + " モード）。" + INTERVAL_MILLIS + "ms ごとにジョブを積みます");
-    }
-
-    // 1回ぶんの処理。ジョブを1件積む
-    private static void tick(Channel channel, String name, boolean safe) throws Exception {
-        // 今キューにたまっている件数。ワーカーが追い付いているかの目安になる
-        int backlog = channel.queueDeclarePassive(QUEUE).getMessageCount();
-        // 「第何周期か」を表す番号。同じ周期なら、どのスケジューラーが積んでも同じ値になる
-        long slot = System.currentTimeMillis() / INTERVAL_MILLIS;
-        String jobId;
-        if (safe) {
-            // 前回のジョブがまだ残っているなら、積まずにスキップする（積み上がりを防ぐ）
-            if (backlog > 0) {
-                Console.log(name + " スキップ: 未処理のジョブが " + backlog + " 件あります");
-                return;
-            }
-            // 周期の番号からジョブIDを決める。同じ周期のジョブは、必ず同じIDになる
-            jobId = "report-" + slot;
-        } else {
-            // 毎回、新しい一意なIDを振る
-            jobId = "report-" + UUID.randomUUID();
+// 1回ぶんの処理。ジョブを1件積む
+private static void tick(Channel channel, String name, boolean safe) throws Exception {
+    // 今キューにたまっている件数。ワーカーが追い付いているかの目安になる
+    int backlog = channel.queueDeclarePassive(QUEUE).getMessageCount();
+    // 「第何周期か」を表す番号。同じ周期なら、どのスケジューラーが積んでも同じ値になる
+    long slot = System.currentTimeMillis() / INTERVAL_MILLIS;
+    String jobId;
+    if (safe) {
+        // 前回のジョブがまだ残っているなら、積まずにスキップする（積み上がりを防ぐ）
+        if (backlog > 0) {
+            Console.log(name + " スキップ: 未処理のジョブが " + backlog + " 件あります");
+            return;
         }
-        // ジョブIDを messageId に入れて、永続メッセージとして積む
-        AMQP.BasicProperties props = new AMQP.BasicProperties.Builder()
-                .messageId(jobId).deliveryMode(2).build();
-        channel.basicPublish("", QUEUE, props, ("売上レポート " + slot).getBytes(StandardCharsets.UTF_8));
-        Console.log(name + " ジョブを積みました " + jobId + "（キューの滞留 " + backlog + " 件）");
+        // 周期の番号からジョブIDを決める。同じ周期のジョブは、必ず同じIDになる
+        jobId = "report-" + slot;
+    } else {
+        // 毎回、新しい一意なIDを振る
+        jobId = "report-" + UUID.randomUUID();
     }
+    // ジョブIDを messageId に入れて、永続メッセージとして積む
+    AMQP.BasicProperties props = new AMQP.BasicProperties.Builder()
+            .messageId(jobId).deliveryMode(2).build();
+    channel.basicPublish("", QUEUE, props, ("売上レポート " + slot).getBytes(StandardCharsets.UTF_8));
+    Console.log(name + " ジョブを積みました " + jobId + "（キューの滞留 " + backlog + " 件）");
 }
 ```
 
@@ -119,78 +68,27 @@ public class ReportScheduler {
 
 起動引数の `naive` と `safe` は、ステップ6で使います。まずは `naive` で動かします。
 
-ジョブを処理するワーカーも書きます。`src/main/java/com/example/async/batch/ReportWorker.java` を新規作成します。
+ジョブを処理するワーカーも読みます。[ReportWorker.java](../src/main/java/com/example/async/batch/ReportWorker.java) を開きます。中心となる部分を抜粋します。
 
-<!-- code: answers/src/main/java/com/example/async/batch/ReportWorker.java -->
+<!-- code: src/main/java/com/example/async/batch/ReportWorker.java#handleDelivery -->
 ```java
-package com.example.async.batch;
-
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.util.HashSet;
-import java.util.Set;
-
-import com.example.async.common.Console;
-import com.example.async.common.RabbitConnection;
-import com.rabbitmq.client.AMQP;
-import com.rabbitmq.client.Channel;
-import com.rabbitmq.client.Connection;
-import com.rabbitmq.client.DefaultConsumer;
-import com.rabbitmq.client.Envelope;
-
 /**
- * report-jobs キューから売上レポートのジョブを取り出して処理するワーカー。
- * 同じジョブID（messageId）を2回受け取ったら、2回目は処理せずに捨てる。
+ * レポート作成のジョブを1件処理する。
  */
-public class ReportWorker extends DefaultConsumer {
-    // 1件の処理にかかる時間（ミリ秒）
-    private final long workMillis;
-    // 処理済みのジョブID（学習用にメモリ上で持つ。本番は DB に保存する）
-    private final Set<String> processed = new HashSet<>();
-
-    /**
-     * @param channel    使うチャネル
-     * @param workMillis 1件の処理にかかる時間（ミリ秒）
-     */
-    public ReportWorker(Channel channel, long workMillis) {
-        super(channel);
-        this.workMillis = workMillis;
+@Override
+public void handleDelivery(String consumerTag, Envelope envelope,
+        AMQP.BasicProperties properties, byte[] body) throws IOException {
+    String jobId = properties.getMessageId();
+    String text = new String(body, StandardCharsets.UTF_8);
+    if (!processed.add(jobId)) {
+        // Set.add が false を返すのは、すでに処理済みのジョブID
+        Console.log("重複のためスキップ " + jobId);
+    } else {
+        Console.log("レポート作成 開始 " + jobId + "（" + text + "）");
+        Console.sleep(workMillis);
+        Console.log("レポート作成 完了 " + jobId);
     }
-
-    /**
-     * レポート作成のジョブを1件処理する。
-     */
-    @Override
-    public void handleDelivery(String consumerTag, Envelope envelope,
-            AMQP.BasicProperties properties, byte[] body) throws IOException {
-        String jobId = properties.getMessageId();
-        String text = new String(body, StandardCharsets.UTF_8);
-        if (!processed.add(jobId)) {
-            // Set.add が false を返すのは、すでに処理済みのジョブID
-            Console.log("重複のためスキップ " + jobId);
-        } else {
-            Console.log("レポート作成 開始 " + jobId + "（" + text + "）");
-            Console.sleep(workMillis);
-            Console.log("レポート作成 完了 " + jobId);
-        }
-        getChannel().basicAck(envelope.getDeliveryTag(), false);
-    }
-
-    /**
-     * ワーカーを起動する。
-     *
-     * @param args [0] 1件の処理時間（秒、省略時は 1）
-     * @throws Exception 接続に失敗した場合
-     */
-    public static void main(String[] args) throws Exception {
-        long workMillis = (args.length > 0 ? Long.parseLong(args[0]) : 1) * 1000;
-        Connection connection = RabbitConnection.open("report-worker");
-        Channel channel = connection.createChannel();
-        channel.queueDeclare(ReportScheduler.QUEUE, true, false, false, null);
-        channel.basicQos(1);
-        channel.basicConsume(ReportScheduler.QUEUE, false, new ReportWorker(channel, workMillis));
-        Console.log("ワーカー起動（1件 " + workMillis / 1000 + " 秒）。Ctrl+C で終了します");
-    }
+    getChannel().basicAck(envelope.getDeliveryTag(), false);
 }
 ```
 
@@ -219,7 +117,7 @@ public class ReportWorker extends DefaultConsumer {
 
 ## ステップ4: サーバーを2台にする
 
-本番では、冗長化や負荷分散のために、アプリを複数台で動かします。そのとき、スケジューラーも2台ぶん動きます。2つめのスケジューラーを、別のターミナルで起動します。
+本番では、1台が止まっても動き続けるように、また負荷を分け合うために、同じアプリを複数台で動かします。そのとき、スケジューラーも2台ぶん動きます。2つめのスケジューラーを、別のターミナルで起動します。
 
 ```bash
 # ターミナル3
@@ -300,22 +198,22 @@ A ジョブを積みました report-597904497（キューの滞留 0 件）
 A スキップ: 未処理のジョブが 1 件あります
 ```
 
-**Why**: 2台のスケジューラーが同時に動いても、結果は1台のときと同じになります。これは第12章の **冪等性** そのものです。時刻が来るたびにジョブを積む定期バッチは、重複が必ず起こる前提で作ります。
+**Why**: 2台のスケジューラーが同時に動いても、結果は1台のときと同じになります。これは第12章の **冪等**（何度やっても結果が同じ）の考え方そのものです。時刻が来るたびにジョブを積む定期バッチは、重複が必ず起こる前提で作ります。
 
 **⚠️ よくある失敗・誤解**: `safe` モードの「滞留」は、キューにたまっている（まだ誰にも渡していない）ジョブの数です。ワーカーが今処理している最中のジョブは数えません。そのため、スキップの判断は「次の周期が来たとき、前のジョブが終わらず、新しく積んだものが待っている」状況で効きます。
 
 ## ステップ7: 本番で気をつけること
 
 - **スケジューラーを1台だけで動かす**: 冪等にするだけでなく、そもそも1台しか積まないようにするのが理想です。次のような方法があります。
-  - Kubernetes の CronJob や、クラウドのスケジューラー（Amazon EventBridge Scheduler、Google Cloud Scheduler）を使う。これらは時刻に1回だけ、1つのジョブを起動する
-  - アプリ内にスケジューラーを持つ場合は、DB のロックや、リーダー選出の仕組みで「担当するのは1台だけ」にする（Quartz のクラスター機能、ShedLock など）
+  - クラウドのスケジューラーなど、外部の定期実行の仕組みを使う。これらは時刻に1回だけ、1つのジョブを起動する
+  - アプリ内にスケジューラーを持つ場合は、DB の排他制御（同時に1つだけが使えるようにする仕組み）などで「担当するのは1台だけ」にする（Quartz や ShedLock といったライブラリがある）
 - **止まっていた間の取りこぼし**: アプリが止まっていた時間帯に、時刻が来たジョブは積まれません。「起動時に、前回の実行以降の分を埋める」処理が要るかを、業務ごとに決めます。
 - **時刻の扱い**: タイムゾーン（サーバーは UTC、業務は日本時間など）、夏時間、月末や閏年に注意します。「毎月31日」は、30日までの月には存在しません。
 - **集中する時刻を避ける**: 全員が毎日0時ちょうどに動かすと、その時刻にサーバーやデータベースの負荷が集中します。数分ずらして分散させます。
 - **長い処理は分割する**: 100万件を1つのジョブで処理するのではなく、1万件ずつの100個のジョブに分けて積むと、ワーカーを増やして並列に処理でき、失敗してもやり直す範囲が小さくなります。
 - **結果を通知する**: バッチの成否に、誰かが気づける仕組みを用意します。「動いているはず」の集計が何週間も止まっていた、という話は珍しくありません。実行の履歴も残します。
 
-**💼 現場Tip**: データの連鎖を扱うバッチの世界には、Apache Airflow のように、ジョブの依存関係（A が終わったら B と C、両方終わったら D）を定義して実行するツールがあります。これは第21〜22章のワークフローと同じ考え方を、定期バッチに応用したものです。
+**💼 現場Tip**: データの連鎖を扱うバッチの世界には、Apache Airflow のように、ジョブの依存関係（A が終わったら B と C、両方終わったら D）を定義して実行するツールがあります。これは第20〜21章のワークフローと同じ考え方を、定期バッチに応用したものです。
 
 ## 動作確認
 

@@ -2,11 +2,11 @@
 
 ## この章のゴール
 
-RabbitMQ の管理 HTTP API を使い、curl と Java の `HttpClient` でメッセージを送受信します。HTTP で「取りに行く（ポーリングする）」受信方法の限界を体験し、次の章から専用のクライアントライブラリを使う理由を理解します。
+RabbitMQ の管理用 HTTP API（HTTP で RabbitMQ を操作する窓口）を使い、curl でメッセージを送受信します。HTTP で「取りに行く（ポーリングする）」受信方法の限界を体験し、次の章から専用のクライアントライブラリを使う理由を理解します。
 
 ## Why: なぜこれを学ぶのか
 
-「ブローカーにメッセージを送って受け取るだけなら、HTTP でよいのでは」と考えるのは自然です。HTTP なら curl でも Bash でも書けて、ライブラリも要りません。実際、Amazon SQS や Google Cloud Pub/Sub は HTTP（や gRPC）の API で操作します。
+「ブローカーにメッセージを送って受け取るだけなら、HTTP でよいのでは」と考えるのは自然です。HTTP なら curl でも Bash でも書けて、ライブラリも要りません。実際、Amazon SQS などのクラウドのサービスは、HTTP を使った API で操作できます。
 
 一方で、HTTP だけでは「メッセージが届いた瞬間に受け取る」ことが苦手です。この章では、あえて HTTP だけで送受信を作り、どこで困るのかを確かめます。
 
@@ -73,175 +73,42 @@ curl -s -u app:app -X POST \
 
 1回目で `ack_requeue_false` を指定したのでメッセージは消え、2回目は空になりました。
 
-## ステップ4: Java の HttpClient でメッセージを送る
+## ステップ4: curl でポーリングして受け取る
 
-同じことを Java で書きます。`src/main/java/com/example/async/http/HttpPublisher.java` を新規作成します。
+HTTP には「サーバーから突然データを送り付ける」仕組みが基本的にありません。そのため、受け取る側は一定間隔でキューに「何か届いていますか」と聞きに行きます。これを **ポーリング** と呼びます。
 
-<!-- code: answers/src/main/java/com/example/async/http/HttpPublisher.java -->
-```java
-package com.example.async.http;
-
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.nio.charset.StandardCharsets;
-import java.util.Base64;
-
-import com.example.async.common.Console;
-
-/**
- * RabbitMQ 管理プラグインの HTTP API を使って、キューにメッセージを1件送るクラス。
- * AMQP ライブラリを使わず、JDK 標準の HttpClient だけで動く。
- */
-public class HttpPublisher {
-    // 管理 HTTP API のベースURL（%2F は仮想ホスト "/" をURLエンコードしたもの）
-    private static final String BASE = "http://localhost:15672/api";
-    // Basic 認証ヘッダーの値（app:app を Base64 にしたもの）
-    private static final String AUTH = "Basic "
-            + Base64.getEncoder().encodeToString("app:app".getBytes(StandardCharsets.UTF_8));
-
-    /**
-     * 引数の文字列を hello-http キューへ送る。
-     *
-     * @param args 送る本文（省略時は固定の文字列）
-     * @throws Exception 通信に失敗した場合
-     */
-    public static void main(String[] args) throws Exception {
-        // 送る本文を決める
-        String text = args.length > 0 ? args[0] : "HTTPから送った注文 A-1";
-        // HttpClient はスレッドセーフなので1つ作って使い回す
-        // RabbitMQ の管理 HTTP API は HTTP/2 へのアップグレードに対応しないため、HTTP/1.1 を明示する
-        HttpClient client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
-        // 既定エクスチェンジ（amq.default）に routing_key=キュー名 で送ると、そのキューに直接届く
-        String body = "{\"properties\":{},\"routing_key\":\"hello-http\","
-                + "\"payload\":\"" + text + "\",\"payload_encoding\":\"string\"}";
-        HttpRequest request = HttpRequest.newBuilder(URI.create(BASE + "/exchanges/%2F/amq.default/publish"))
-                // 認証ヘッダーを付ける
-                .header("Authorization", AUTH)
-                // 送る本文は JSON
-                .header("Content-Type", "application/json")
-                // POST で送る
-                .POST(HttpRequest.BodyPublishers.ofString(body))
-                .build();
-        // 同期的に送信してレスポンスを受け取る
-        HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-        // {"routed":true} なら、どこかのキューに届いたという意味
-        Console.log("status=" + response.statusCode() + " body=" + response.body());
-    }
-}
-```
-
-実行します。
+ステップ3の受け取りを、3秒ごとに繰り返すループで試します。ターミナル1で、次を実行します。
 
 ```bash
-./run.sh http.HttpPublisher
+# 3秒ごとに hello-http キューを見に行く（Ctrl+C で止める）
+while true; do
+  curl -s -u app:app -X POST \
+    -H 'content-type: application/json' \
+    -d '{"count":1,"ackmode":"ack_requeue_false","encoding":"auto"}' \
+    http://localhost:15672/api/queues/%2F/hello-http/get
+  echo " ($(date +%T))"
+  sleep 3
+done
 ```
+
+ループが動いている間に、ターミナル2でステップ2の送信コマンドを1回実行します。ターミナル1には、次のように表示されます。
 
 ```text
-[09:15:18.496][main] status=200 body={"routed":true}
+[] (12:22:28)
+[] (12:22:31)
+[{"payload_bytes":10,...,"payload":"注文 A-2","payload_encoding":"string"}] (12:22:34)
+[] (12:22:37)
 ```
 
-**Why**: `starter-java-first-steps` 第11章で使った `HttpClient` で、curl と同じリクエストを組み立てています。Basic 認証は「`ユーザー名:パスワード` を Base64 にして `Authorization` ヘッダーに入れる」という決まりなので、`Base64.getEncoder()` で作っています。
+`[]` は、聞きに行ったのに何もなかった **空振り** です。確認できたら、ループを Ctrl+C で止めます。
 
-**⚠️ よくある失敗・誤解**: `HttpClient.newHttpClient()` をそのまま使うと、`java.io.IOException: EOF reached while reading` で失敗します。Java の `HttpClient` は既定で HTTP/2 を使おうとし、平文の `http://` では HTTP/2 へのアップグレードを要求します。RabbitMQ の管理 API はこれに応じず接続を切るため、`.version(HttpClient.Version.HTTP_1_1)` で HTTP/1.1 を明示しています。
-
-## ステップ5: Java でポーリングして受け取る
-
-次に、受信側を書きます。HTTP には「サーバーから突然データを送り付ける」仕組みが基本的にないので、一定間隔でキューに「何か届いていますか」と聞きに行きます。これを **ポーリング** と呼びます。
-
-`src/main/java/com/example/async/http/HttpPollingConsumer.java` を新規作成します。
-
-<!-- code: answers/src/main/java/com/example/async/http/HttpPollingConsumer.java -->
-```java
-package com.example.async.http;
-
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.nio.charset.StandardCharsets;
-import java.util.Base64;
-
-import com.example.async.common.Console;
-
-/**
- * HTTP API で hello-http キューを一定間隔で「取りに行く」（ポーリングする）コンシューマー。
- * メッセージがなくても毎回リクエストが飛ぶこと、届いてから受け取るまで遅延があることを体験する。
- */
-public class HttpPollingConsumer {
-    // 管理 HTTP API のベースURL
-    private static final String BASE = "http://localhost:15672/api";
-    // Basic 認証ヘッダーの値
-    private static final String AUTH = "Basic "
-            + Base64.getEncoder().encodeToString("app:app".getBytes(StandardCharsets.UTF_8));
-    // ポーリング間隔（ミリ秒）
-    private static final long INTERVAL_MILLIS = 3000;
-
-    /**
-     * Ctrl+C で止めるまで、3秒ごとにキューからメッセージを1件取り出す。
-     *
-     * @param args 使わない
-     * @throws Exception 通信に失敗した場合
-     */
-    public static void main(String[] args) throws Exception {
-        // RabbitMQ の管理 HTTP API は HTTP/2 へのアップグレードに対応しないため、HTTP/1.1 を明示する
-        HttpClient client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build();
-        // ackmode=ack_requeue_false は「取り出したらキューから消す」という指定
-        String body = "{\"count\":1,\"ackmode\":\"ack_requeue_false\",\"encoding\":\"auto\"}";
-        // 何回目のリクエストかを数える
-        int polls = 0;
-        while (true) {
-            polls++;
-            HttpRequest request = HttpRequest.newBuilder(URI.create(BASE + "/queues/%2F/hello-http/get"))
-                    .header("Authorization", AUTH)
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(body))
-                    .build();
-            HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
-            // 空配列 [] ならメッセージがなかった（空振り）
-            if (response.body().equals("[]")) {
-                Console.log("poll #" + polls + " 空振り");
-            } else {
-                Console.log("poll #" + polls + " 受信: " + response.body());
-            }
-            // 次のポーリングまで待つ
-            Thread.sleep(INTERVAL_MILLIS);
-        }
-    }
-}
-```
-
-ターミナルを2つ開き、1つめで受信側を起動します。
-
-```bash
-./run.sh http.HttpPollingConsumer
-```
-
-2つめのターミナルで、何回か送信します。
-
-```bash
-./run.sh http.HttpPublisher "注文 A-2"
-```
-
-受信側には、次のように表示されます。
-
-```text
-[09:15:22.216][main] poll #1 受信: [{"payload_bytes":29,...,"payload":"注文 A-2",...}]
-[09:15:25.230][main] poll #2 空振り
-[09:15:28.243][main] poll #3 空振り
-[09:15:31.251][main] poll #4 空振り
-```
-
-確認できたら、受信側を Ctrl+C で止めます。
-
-ポーリングの流れを図にすると、次のようになります。受信側は、メッセージの有無と関係なく、3秒ごとに問い合わせます。
+ポーリングの流れを図にすると、次のようになります。受け取る側は、メッセージの有無と関係なく、3秒ごとに問い合わせます。
 
 ```mermaid
 sequenceDiagram
-    participant P as HttpPublisher
+    participant P as 送る側（curl）
     participant B as RabbitMQ
-    participant C as HttpPollingConsumer
+    participant C as 受け取る側（curl のループ）
     C->>B: 届いていますか
     B-->>C: 空（空振り）
     P->>B: 注文 A-2 を送る
@@ -259,7 +126,9 @@ sequenceDiagram
 
 間隔を短くすれば遅延は減りますが、空振りのリクエストが増えてブローカーの負荷になります。間隔を長くすれば負荷は減りますが、遅延が増えます。ポーリングでは、この2つを同時に解決できません。
 
-**🔍 確認・実験してみよう**: `HttpPollingConsumer` を2つのターミナルで同時に起動し、`HttpPublisher` で5回送ってみましょう。1件のメッセージが両方に届くでしょうか、それともどちらか一方だけでしょうか。第15章の P2P と Pub/Sub のどちらの動きになるか、予想してから確かめてみましょう。
+**🔍 確認・実験してみよう**: `sleep 3` を `sleep 1` や `sleep 10` に変えると、送ってから表示されるまでの時間と、空振りの回数はどう変わるでしょうか。予想してから確かめてみましょう。
+
+**💼 現場Tip**: Java のプログラムから同じ HTTP API を呼ぶこともできます。`starter-java-first-steps` で学んだ `HttpClient` を使い、curl と同じリクエストを組み立てるだけです。ただし受信の方式はポーリングのままなので、ここで見た問題はそのまま残ります。
 
 ## ステップ6: HTTP API の向き・不向きを知る
 
@@ -269,24 +138,17 @@ RabbitMQ の公式ドキュメントでも、管理 HTTP API でのメッセー�
 | :--- | :--- | :--- |
 | 受信の方式 | プル（ポーリング） | プッシュ（届いた瞬間に通知される） |
 | 接続 | リクエストごと | 1本の接続を張りっぱなし |
-| ack | 取り出した時点で決める | 処理が終わってから返せる |
+| ack（処理完了の知らせ） | 取り出した時点で決める | 処理が終わってから返せる |
 | 用途 | 動作確認、運用ツール、監視 | アプリ本体の送受信 |
 
-**💼 現場Tip**: クラウドのサービスは HTTP ベースでも、ポーリングの弱点を補う工夫をしています。
-
-- Amazon SQS の **ロングポーリング**: 受信リクエストを最大20秒間サーバー側で待たせ、その間にメッセージが届いたらすぐ返す。空振りと遅延の両方を減らせる
-- Google Cloud Pub/Sub の **プッシュサブスクリプション**: メッセージが届くと、ブローカーのほうから指定した URL に HTTP POST してくる（Webhook）
-- 各社の SDK は、内部で gRPC のストリーミングなどを使い、プッシュに近い受信を実現している
-
-**💼 現場Tip**: 管理 HTTP API は、運用の自動化では大いに役立ちます。たとえば `GET /api/queues` でキューごとの滞留件数を取得し、しきい値を超えたらアラートを出す監視スクリプトは、よく作られます。
+**💼 現場Tip**: クラウドのメッセージングサービスの中には、HTTP で操作するものもあります。そうしたサービスは、「サーバー側で少し待ってから返す」「届いたらサービスのほうから知らせる」といった工夫で、ポーリングの弱点を補っています。
 
 ## 動作確認
 
-次の3つを確認できたら完了です。
+次の2つを確認できたら完了です。
 
 1. curl でキューを作り、送信し、受信できた
-2. `./run.sh http.HttpPublisher` が `{"routed":true}` を表示した
-3. `./run.sh http.HttpPollingConsumer` で、受信できた回と空振りの回の両方を確認できた
+2. curl のループで、受信できた回と空振りの回の両方を確認できた
 
 ## もっと良くしてみよう
 
@@ -294,11 +156,11 @@ RabbitMQ の公式ドキュメントでも、管理 HTTP API でのメッセー�
 
 1. `ackmode` に `ack_requeue_true` を指定すると、何回 get しても同じメッセージが返ってくるのはなぜでしょうか。
 2. ポーリング間隔を短くすると、何がよくなり、何が悪くなるでしょうか。
-3. Java の `HttpClient` で HTTP/1.1 を明示しないと失敗するのはなぜでしょうか。
+3. 管理 HTTP API での送受信が、本番のアプリ本体に向かないのはなぜでしょうか。
 
 ### 発展改善クイズ
 
-1. `HttpPollingConsumer` は `ack_requeue_false` で取り出しています。取り出した直後、処理の途中でプログラムが落ちると、そのメッセージはどうなるでしょうか。
+1. ステップ4のループは `ack_requeue_false` で取り出しています。取り出した直後、処理の途中でプログラムが落ちると、そのメッセージはどうなるでしょうか。
 2. 空振りのときだけポーリング間隔を少しずつ延ばし、受信できたら短く戻す、という工夫が考えられます。この工夫でも解決できない問題は何でしょうか。
 
 ---

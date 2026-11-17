@@ -15,10 +15,18 @@
     </properties>
 
     <dependencies>
-        <!--
-            第06章で amqp-client と slf4j-simple を、第15章で h2 を、ここに自分で追加します。
-            追加する内容は各章を参照してください。
-        -->
+        <!-- RabbitMQ 公式の Java クライアント（AMQP 0-9-1） -->
+        <dependency>
+            <groupId>com.rabbitmq</groupId>
+            <artifactId>amqp-client</artifactId>
+            <version>5.37.0</version>
+        </dependency>
+        <!-- amqp-client が使うログ API（SLF4J）の出力先 -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>1.7.36</version>
+        </dependency>
     </dependencies>
 
     <build>

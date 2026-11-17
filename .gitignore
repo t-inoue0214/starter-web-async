@@ -3,3 +3,8 @@ data
 *.class
 .DS_Store
 node_modules
+.markdownlint-cli2.jsonc
+.textlintrc.json
+package-lock.json
+package.json
+.claude

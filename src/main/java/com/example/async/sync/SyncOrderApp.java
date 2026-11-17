@@ -5,8 +5,8 @@ import java.util.Random;
 import com.example.async.common.Console;
 
 /**
- * 注文確定の後続処理（メール・在庫・ポイント）を、同期呼び出しで順番に実行するアプリ。
- * Pub/Sub を使わない構成で「何が困るか」を体験するための出発点。
+ * 注文確定のあとの処理（メール・在庫・ポイント）を、同期呼び出しで順番に実行するアプリ。
+ * 非同期の仕組みを使わない構成で「何が困るか」を体験するための出発点。
  */
 public class SyncOrderApp {
     // 乱数のシードを固定して、毎回同じ結果になるようにする
@@ -36,7 +36,7 @@ public class SyncOrderApp {
         }
     }
 
-    // 注文確定。後続の3サービスを同期的に（終わるまで待ちながら）順に呼ぶ
+    // 注文確定。あとに続く3つのサービスを同期的に（終わるまで待ちながら）順に呼ぶ
     private static void placeOrder(String orderId) {
         // 注文をDBに保存した、という想定
         Console.log("注文 " + orderId + " をDBに保存");

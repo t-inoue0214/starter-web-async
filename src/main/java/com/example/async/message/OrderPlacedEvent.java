@@ -9,7 +9,6 @@ import com.example.async.common.SimpleJson;
 
 /**
  * 「注文が確定した」という事実を表すイベント。イミュータブル。
- * 後の章（冪等性・Outbox）でもこのクラスを使う。
  */
 public class OrderPlacedEvent {
     /** イベントの種類。受信側はこれを見て処理を振り分ける */

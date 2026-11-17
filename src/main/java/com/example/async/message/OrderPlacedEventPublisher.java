@@ -22,7 +22,7 @@ public class OrderPlacedEventPublisher {
         int count = args.length > 0 ? Integer.parseInt(args[0]) : 2;
         try (Connection connection = RabbitConnection.open("order-placed-event-publisher");
                 Channel channel = connection.createChannel()) {
-            // 第18章で作った topic エクスチェンジを使う
+            // 第17章で作った topic エクスチェンジを使う
             channel.exchangeDeclare(OrderEventTopicPublisher.EXCHANGE, BuiltinExchangeType.TOPIC, true);
             EventPublisher publisher = new EventPublisher(channel, OrderEventTopicPublisher.EXCHANGE);
             for (int i = 1; i <= count; i++) {
